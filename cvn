@@ -1,0 +1,225 @@
+#!/usr/local/perl-5.8.0/bin/perl -w
+use strict;
+use warnings;
+use File::Find::Rule;
+use Date::Parse qw( str2time );
+use Text::Glob qw( glob_to_regex );
+use File::Spec::Functions qw( catfile splitpath );
+use File::Copy ();
+use Data::Dumper;
+
+our $VERSION = 0.01;
+
+=head1 NAME
+
+cvn - a unified wrapper around cvs and svn
+
+=head1 SYNOPSIS
+
+cvn [cvs|svn command here]
+
+=head1 DESCRIPTION
+
+C<cvn> at its simplest provides a way to automatically invoke wither
+ther svn of cvs binary, depending on whether the current working
+directory is held under CVS or Subversion.
+
+It also simulates some commands in the cases (eg cvs doesn't support
+C<st> or offline diffing) where one of the apps is deficient (where
+possible)
+
+=head1 Notes on simulated commands
+
+=cut
+
+sub get_cvs_entries {
+    my %entries;
+    for ( find( directory => name => 'CVS', in => '.' ) ) {
+        my $dir = (splitpath $_)[1];
+        open my $fh, "$_/Entries" or next;
+        while (<$fh>) {
+            next if /^D/;
+            chomp;
+            my %field;
+            @field{qw( foo name version modified bar baz )} = split /\//, $_;
+            $field{mtime} = str2time $field{modified}, "UTC";
+            my $filename = $dir ? catfile($dir, $field{name}) : $field{name};
+            $field{path} = $filename;
+            $entries{ $filename } = \%field;
+        }
+    }
+    return %entries;
+}
+
+sub get_cvs_ignores {
+    my @ignored;
+    for my $ignore ( find( file => name => '.cvsignore', in => '.' ) ) {
+        my $dir = (splitpath $_)[1];
+        open my $fh, "$ignore" or next;
+        while (<$fh>) {
+            chomp;
+            my $filename = $dir ? catfile($dir, $_) : $_;
+            push @ignored, $filename;
+        }
+    }
+    print Dumper \@ignored;
+    return @ignored;
+}
+
+sub non_cvs_files {
+    find( or => [ find( directory =>
+                        name => 'CVS',
+                        prune =>
+                        discard =>),
+                  find( file => ),
+                ]
+        );
+}
+
+my %simulated;
+
+=head2 st
+
+simulated under cvs by comparing the server-modified date in
+CVS/Entries with the mtime of the file(s)
+
+=cut
+
+$simulated{cvs}{st} = sub {
+    if (@_ && $_[0] eq '-v') {
+        print "$0: can't emulate st -v under CVS\n";
+        exit 1;
+    }
+    my %entries = get_cvs_entries;
+    for my $file ( non_cvs_files->in('.') ) {
+        # TODO honour .cvsignore
+        !$entries{ $file }
+          and do { print "? $file\n"; next };
+
+        (stat $file)[9] > $entries{ $file }{mtime}
+          and do { print "M $file\n"; next };
+    }
+    return 0;
+};
+
+
+=head2 up
+
+extended for CVS to keep texts in CVS/text.file.rev
+
+=cut
+
+sub _text_name {
+    our %entry;
+    local *entry = shift;
+    my $dir = (splitpath $entry{path})[1];
+    ($dir ? "$dir/" : "") . "CVS/text_$entry{name}_$entry{version}";
+}
+
+$simulated{cvs}{up} = sub {
+    system 'cvs', 'up', @_;
+    my %entries = get_cvs_entries;
+    for my $file ( keys %entries ) {
+        our %entry;
+        local *entry = $entries{ $file };
+        my $text = _text_name( \%entry );
+        next if -e $text;
+
+        if ((stat $file)[9] > $entry{mtime}) {
+            # we seem to have local mods, pull from the repository
+            `cvs up -p -r $entry{version} $file > $text 2> /dev/null`;
+        }
+        else {
+            File::Copy::copy($file, $text);
+        }
+        # touch it back
+        utime $entry{mtime}, $entry{mtime}, $text;
+    }
+};
+
+
+=head2 diff
+
+extended for CVS to attempt to use the CVS/text
+
+=cut
+
+$simulated{cvs}{diff} = sub {
+    my %entries = get_cvs_entries;
+    for my $file (@_ ? @_ : non_cvs_files->in('.')) {
+        next unless $entries{$file};
+        my $text = _text_name( $entries{$file} );
+        if (-e $text) {
+            system 'diff', '-u', $text, $file;
+        }
+        else {
+            system 'cvs', 'diff', '-u', $file;
+        }
+    }
+};
+
+
+=head2 revert
+
+extended for CVS to attempt to use the CVS/text
+
+=cut
+
+$simulated{cvs}{revert} = sub {
+    my %entries = get_cvs_entries;
+    for my $file (@_ ? @_ : non_cvs_files->in('.')) {
+        next unless $entries{$file};
+        print "Reverting: $file\n";
+        our %entry; local *entry = $entries{$file};
+        my $text = _text_name( \%entry );
+        if (-e $text) {
+            File::Copy::copy($text, $file);
+        }
+        else {
+            `cvs up -p -r $entry{version} $file > $file`;
+        }
+        # touch it back so we know it's good
+        utime $entry{mtime}, $entry{mtime}, $file;
+        print "$file reverted\n";
+    }
+};
+
+
+sub simulate {
+    my $app = shift;
+    my $cmd = shift;
+    my $sub = $simulated{ $app }{ $cmd } || return;
+    exit $sub->(@_);
+}
+
+my $command;
+$command ||= 'svn' if -d '.svn';
+$command ||= 'cvs' if -d 'CVS';
+die "not under vcs" unless $command;
+
+simulate $command, @ARGV;
+exec     $command, @ARGV;
+
+
+=head1 TODO
+
+honour .cvsignore for CVS st
+
+improve parameter parsing.
+
+improve documentation.
+
+be a little more paranoid about execing stuff
+
+=head1 AUTHOR
+
+Richard Clamp <richardc@unixbeard.net>
+
+=head1 COPYRIGHT
+
+Copyright (C) 2002 Richard Clamp.  All Rights Reserved.
+
+This module is free software; you can redistribute it and/or modify it
+under the same terms as Perl itself.
+
+=cut
