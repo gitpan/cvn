@@ -7,7 +7,7 @@ use Text::Glob qw( glob_to_regex );
 use File::Spec::Functions qw( catfile splitpath );
 use File::Copy ();
 
-our $VERSION = 0.02;
+our $VERSION = 0.03;
 
 =head1 NAME
 
@@ -64,9 +64,9 @@ sub get_cvs_ignores {
     return @ignored;
 }
 
-sub non_cvs_files {
+sub non_vcs_files {
     find( or => [ find( directory =>
-                        name => 'CVS',
+                        name => [ 'CVS', '.svn' ],
                         prune =>
                         discard =>),
                   find( file => ),
@@ -89,23 +89,19 @@ $simulated{cvs}{st} = sub {
         exit 1;
     }
     my %entries = get_cvs_entries;
-    for my $file ( non_cvs_files->in('.') ) {
+    for my $file ( non_vcs_files->in('.') ) {
         # TODO honour .cvsignore
         !$entries{ $file }
           and do { print "? $file\n"; next };
+
+        !$entries{ $file }{version}
+          and do { print "A $file\n"; next };
 
         (stat $file)[9] > $entries{ $file }{mtime}
           and do { print "M $file\n"; next };
     }
     return 0;
 };
-
-
-=head2 C<up>
-
-extended for CVS to keep texts in CVS/text_$file_$rev
-
-=cut
 
 sub _text_name {
     our %entry;
@@ -114,8 +110,14 @@ sub _text_name {
     ($dir ? "$dir/" : "") . "CVS/text_$entry{name}_$entry{version}";
 }
 
-$simulated{cvs}{up} = sub {
-    system 'cvs', 'up', @_;
+=head2 C<get_texts>
+
+keep texts in CVS/text_$file_$rev - used for offline diffing
+
+=cut
+
+$simulated{svn}{get_texts} = sub { 0 };
+$simulated{cvs}{get_texts} = sub {
     my %entries = get_cvs_entries;
     for my $file ( keys %entries ) {
         our %entry;
@@ -123,6 +125,7 @@ $simulated{cvs}{up} = sub {
         my $text = _text_name( \%entry );
         next if -e $text;
 
+        # XXX added files need loving here
         if ((stat $file)[9] > $entry{mtime}) {
             # we seem to have local mods, pull from the repository
             `cvs up -p -r $entry{version} $file > $text 2> /dev/null`;
@@ -135,6 +138,16 @@ $simulated{cvs}{up} = sub {
     }
 };
 
+=head2 C<up>
+
+extended for CVS to invoke C<get_texts> automatically
+
+=cut
+
+$simulated{cvs}{up} = sub {
+    system 'cvs', 'up', @_;
+    $simulated{cvs}{get_texts}->(@_);
+};
 
 =head2 C<diff>
 
@@ -144,7 +157,7 @@ extended for CVS to attempt to use the locally cached text(s)
 
 $simulated{cvs}{diff} = sub {
     my %entries = get_cvs_entries;
-    for my $file (@_ ? @_ : non_cvs_files->in('.')) {
+    for my $file (non_vcs_files->in(@_ ? @_ : '.')) {
         next unless $entries{$file};
         my $text = _text_name( $entries{$file} );
         if (-e $text) {
@@ -165,7 +178,7 @@ extended for CVS to attempt to use the locally cached text(s)
 
 $simulated{cvs}{revert} = sub {
     my %entries = get_cvs_entries;
-    for my $file (@_ ? @_ : non_cvs_files->in('.')) {
+    for my $file (@_ ? @_ : non_vcs_files->in('.')) {
         next unless $entries{$file};
         print "Reverting: $file\n";
         our %entry; local *entry = $entries{$file};
@@ -180,6 +193,30 @@ $simulated{cvs}{revert} = sub {
         utime $entry{mtime}, $entry{mtime}, $file;
         print "$file reverted\n";
     }
+};
+
+=head2 C<rgrep>
+
+simulated in both.  similar to rgrep(1), but deliberately ignores
+files in .svn and CVS directories.
+
+=cut
+
+$simulated{all}{rgrep} = sub {
+    # args parsing is tricky - let's go shopping!
+    my (@switches, $pattern, $no_more_switches);
+    while (@_) {
+        local $_ = shift;
+        if (/^--$/)                       { $no_more_switches = 1; next }
+        if (!$no_more_switches && /^-/)   { push @switches, $_;    next }
+        $pattern = $_; last;
+    }
+
+    die "no pattern" unless defined $pattern;
+    for my $file (non_vcs_files->in( @_ ? @_ : '.' )) {
+        system 'grep', '-H', @switches, '--', $pattern, $file;
+    }
+    0;
 };
 
 =head2 C<version>
@@ -223,6 +260,11 @@ improve parameter parsing
 improve documentation
 
 be a little more paranoid about invoking commands
+
+=head1 CAVEATS
+
+C<rgrep> invokes grep with the -H option, which may not be supported
+by your native version of grep
 
 =head1 AUTHOR
 
