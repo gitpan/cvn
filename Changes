@@ -1,0 +1,7 @@
+0.02	4th December 2002
+	Added dependencies to Makefile.PL
+	Added a simple test
+	Documentation fixes
+
+0.01	2nd December 2002
+	Initial release

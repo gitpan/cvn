@@ -1,3 +1,5 @@
+Changes
 MANIFEST
 Makefile.PL
 cvn
+t/cvn.t

@@ -6,9 +6,8 @@ use Date::Parse qw( str2time );
 use Text::Glob qw( glob_to_regex );
 use File::Spec::Functions qw( catfile splitpath );
 use File::Copy ();
-use Data::Dumper;
 
-our $VERSION = 0.01;
+our $VERSION = 0.02;
 
 =head1 NAME
 
@@ -20,8 +19,8 @@ cvn [cvs|svn command here]
 
 =head1 DESCRIPTION
 
-C<cvn> at its simplest provides a way to automatically invoke wither
-ther svn of cvs binary, depending on whether the current working
+C<cvn> at its simplest provides a way to automatically invoke either
+the svn of cvs binary, depending on whether the current working
 directory is held under CVS or Subversion.
 
 It also simulates some commands in the cases (eg cvs doesn't support
@@ -62,7 +61,6 @@ sub get_cvs_ignores {
             push @ignored, $filename;
         }
     }
-    print Dumper \@ignored;
     return @ignored;
 }
 
@@ -78,9 +76,9 @@ sub non_cvs_files {
 
 my %simulated;
 
-=head2 st
+=head2 C<st>
 
-simulated under cvs by comparing the server-modified date in
+simulated under CVS by comparing the server-modified date in
 CVS/Entries with the mtime of the file(s)
 
 =cut
@@ -103,9 +101,9 @@ $simulated{cvs}{st} = sub {
 };
 
 
-=head2 up
+=head2 C<up>
 
-extended for CVS to keep texts in CVS/text.file.rev
+extended for CVS to keep texts in CVS/text_$file_$rev
 
 =cut
 
@@ -138,9 +136,9 @@ $simulated{cvs}{up} = sub {
 };
 
 
-=head2 diff
+=head2 C<diff>
 
-extended for CVS to attempt to use the CVS/text
+extended for CVS to attempt to use the locally cached text(s)
 
 =cut
 
@@ -159,9 +157,9 @@ $simulated{cvs}{diff} = sub {
 };
 
 
-=head2 revert
+=head2 C<revert>
 
-extended for CVS to attempt to use the CVS/text
+extended for CVS to attempt to use the locally cached text(s)
 
 =cut
 
@@ -184,32 +182,47 @@ $simulated{cvs}{revert} = sub {
     }
 };
 
+=head2 C<version>
+
+simulated in both to return the version of the cvn binary
+
+=cut
+
+$simulated{all}{version} = sub {
+    print "cvn version $VERSION\n";
+    return 0;
+};
 
 sub simulate {
     my $app = shift;
     my $cmd = shift;
-    my $sub = $simulated{ $app }{ $cmd } || return;
+    my $sub = $simulated{ $app || '' }{ $cmd }
+      ||      $simulated{ 'all' }{ $cmd }
+      || return;
     exit $sub->(@_);
 }
 
 my $command;
 $command ||= 'svn' if -d '.svn';
 $command ||= 'cvs' if -d 'CVS';
-die "not under vcs" unless $command;
 
 simulate $command, @ARGV;
-exec     $command, @ARGV;
 
+unless ( $command ) {
+    print "svn: current directory isn't under vcs\n";
+    exit 1;
+}
+exec     $command, @ARGV;
 
 =head1 TODO
 
-honour .cvsignore for CVS st
+honour .cvsignore for CVS C<st>
 
-improve parameter parsing.
+improve parameter parsing
 
-improve documentation.
+improve documentation
 
-be a little more paranoid about execing stuff
+be a little more paranoid about invoking commands
 
 =head1 AUTHOR
 
