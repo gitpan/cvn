@@ -1,13 +1,14 @@
 #!/usr/local/perl-5.8.0/bin/perl -w
 use strict;
 use warnings;
-use File::Find::Rule;
 use Date::Parse qw( str2time );
 use Text::Glob qw( glob_to_regex );
 use File::Spec::Functions qw( catfile splitpath );
 use File::Copy ();
+use File::Find::Rule;
 
-our $VERSION = 0.03;
+use vars qw($VERSION);
+$VERSION = 0.04;
 
 =head1 NAME
 
@@ -31,48 +32,64 @@ possible)
 
 =cut
 
-sub get_cvs_entries {
-    my %entries;
-    for ( find( directory => name => 'CVS', in => '.' ) ) {
-        my $dir = (splitpath $_)[1];
-        open my $fh, "$_/Entries" or next;
+# parse and cache the .cvsignore and CVS/Entries files on first hit
+# per directory
+
+my %ignores;
+sub is_ignored {
+    my (undef, $dir, $name) = splitpath( shift );
+    unless ($ignores{ $dir }) {
+        $ignores{ $dir } = [];
+        open my $fh, catfile($dir ? $dir : (), ".cvsignore") or return;
+        $ignores{ $dir } = [ map { chomp; glob_to_regex $_ } <$fh> ];
+    }
+    return grep { $name =~ /$_/ } @{ $ignores{ $dir } };
+}
+
+my %entries;
+sub get_entry {
+    my (undef, $dir, $name) = splitpath( shift );
+    unless ($entries{ $dir }) {
+        $entries{ $dir } = {};
+        open my $fh, catfile($dir ? $dir : (), "CVS", "Entries") or return;
         while (<$fh>) {
-            next if /^D/;
             chomp;
+            next if $_ eq 'D';
             my %field;
-            @field{qw( foo name version modified bar baz )} = split /\//, $_;
-            $field{mtime} = str2time $field{modified}, "UTC";
-            my $filename = $dir ? catfile($dir, $field{name}) : $field{name};
-            $field{path} = $filename;
-            $entries{ $filename } = \%field;
+            @field{qw( dir name version modified bar baz )} = split /\//, $_;
+            $field{mtime} = str2time $field{modified}, "UTC"
+              unless $field{dir};
+            $field{path} = catfile( $dir ? $dir : (), $field{name} );
+            $entries{ $dir }{ $field{name} } = \%field;
         }
     }
-    return %entries;
+    return $entries{ $dir }{ $name };
 }
 
-sub get_cvs_ignores {
-    my @ignored;
-    for my $ignore ( find( file => name => '.cvsignore', in => '.' ) ) {
-        my $dir = (splitpath $_)[1];
-        open my $fh, "$ignore" or next;
-        while (<$fh>) {
-            chomp;
-            my $filename = $dir ? catfile($dir, $_) : $_;
-            push @ignored, $filename;
-        }
+sub dir_entries {
+    my $dir = shift;
+    local *D;
+    opendir D, $dir;
+    map { $dir eq '.' ? $_ : "$dir/$_" } grep { !/^\.\.?$/ } readdir D;
+}
+
+# wander the tree like CVS would, invoking a callback along the way
+sub walk_cvslike {
+    my $callback = pop @_;
+
+    my @what = @_ ? @_ : dir_entries('.');
+    for my $file ( @what ) {
+        next if -d $file && $file =~ m/\bCVS$/;
+        my $entry = get_entry( $file );
+
+        if ($entry && $entry->{dir}) {
+            push @what, dir_entries($file);
+            next;
+        };
+        $callback->($file, %{ $entry || {} });
     }
-    return @ignored;
 }
 
-sub non_vcs_files {
-    find( or => [ find( directory =>
-                        name => [ 'CVS', '.svn' ],
-                        prune =>
-                        discard =>),
-                  find( file => ),
-                ]
-        );
-}
 
 my %simulated;
 
@@ -88,26 +105,29 @@ $simulated{cvs}{st} = sub {
         print "$0: can't emulate st -v under CVS\n";
         exit 1;
     }
-    my %entries = get_cvs_entries;
-    for my $file ( non_vcs_files->in('.') ) {
-        # TODO honour .cvsignore
-        !$entries{ $file }
-          and do { print "? $file\n"; next };
 
-        !$entries{ $file }{version}
-          and do { print "A $file\n"; next };
-
-        (stat $file)[9] > $entries{ $file }{mtime}
-          and do { print "M $file\n"; next };
-    }
+    walk_cvslike( @_,
+                  sub {
+                      my ($file, %entry) = @_;
+                      unless (%entry) {
+                          return if is_ignored( $file );
+                          print "? $file\n"; return;
+                      }
+                      unless ($entry{version}) {
+                          print "A $file\n"; return;
+                      }
+                      if ((stat $file)[9] > $entry{mtime}) {
+                          print "M $file\n"; return;
+                      }
+                  }
+                );
     return 0;
 };
 
 sub _text_name {
-    our %entry;
-    local *entry = shift;
+    my %entry = @_;
     my $dir = (splitpath $entry{path})[1];
-    ($dir ? "$dir/" : "") . "CVS/text_$entry{name}_$entry{version}";
+    catfile( $dir ? $dir : (), "CVS", "text_$entry{name}_$entry{version}" );
 }
 
 =head2 C<get_texts>
@@ -118,24 +138,25 @@ keep texts in CVS/text_$file_$rev - used for offline diffing
 
 $simulated{svn}{get_texts} = sub { 0 };
 $simulated{cvs}{get_texts} = sub {
-    my %entries = get_cvs_entries;
-    for my $file ( keys %entries ) {
-        our %entry;
-        local *entry = $entries{ $file };
-        my $text = _text_name( \%entry );
-        next if -e $text;
+    walk_cvslike( @_,
+                  sub {
+                      my ($file, %entry) = @_;
+                      return unless %entry;
+                      my $text = _text_name( %entry );
+                      next if -e $text;
 
-        # XXX added files need loving here
-        if ((stat $file)[9] > $entry{mtime}) {
-            # we seem to have local mods, pull from the repository
-            `cvs up -p -r $entry{version} $file > $text 2> /dev/null`;
-        }
-        else {
-            File::Copy::copy($file, $text);
-        }
-        # touch it back
-        utime $entry{mtime}, $entry{mtime}, $text;
-    }
+                      # XXX added files need loving here
+                      if ((stat $file)[9] > $entry{mtime}) {
+                          # we seem to have local mods, pull from the repository
+                          `cvs up -p -r $entry{version} $file > $text 2> /dev/null`;
+                      }
+                      else {
+                          File::Copy::copy($file, $text);
+                      }
+                      # touch it back
+                      utime $entry{mtime}, $entry{mtime}, $text;
+                  }
+                );
 };
 
 =head2 C<up>
@@ -156,17 +177,20 @@ extended for CVS to attempt to use the locally cached text(s)
 =cut
 
 $simulated{cvs}{diff} = sub {
-    my %entries = get_cvs_entries;
-    for my $file (non_vcs_files->in(@_ ? @_ : '.')) {
-        next unless $entries{$file};
-        my $text = _text_name( $entries{$file} );
-        if (-e $text) {
-            system 'diff', '-u', $text, $file;
-        }
-        else {
-            system 'cvs', 'diff', '-u', $file;
-        }
-    }
+    walk_cvslike( @_,
+                  sub {
+                      my ($file, %entry) = @_;
+                      return unless %entry;
+                      my $text = _text_name( %entry );
+                      if (-e $text) {
+                          system 'diff', '-u', $text, $file;
+                      }
+                      else {
+                          print "Diffing against server for $file\n";
+                          system 'cvs', 'diff', '-u', $file;
+                      }
+                  }
+                );
 };
 
 
@@ -177,22 +201,23 @@ extended for CVS to attempt to use the locally cached text(s)
 =cut
 
 $simulated{cvs}{revert} = sub {
-    my %entries = get_cvs_entries;
-    for my $file (@_ ? @_ : non_vcs_files->in('.')) {
-        next unless $entries{$file};
-        print "Reverting: $file\n";
-        our %entry; local *entry = $entries{$file};
-        my $text = _text_name( \%entry );
-        if (-e $text) {
-            File::Copy::copy($text, $file);
-        }
-        else {
-            `cvs up -p -r $entry{version} $file > $file`;
-        }
-        # touch it back so we know it's good
-        utime $entry{mtime}, $entry{mtime}, $file;
-        print "$file reverted\n";
-    }
+    walk_cvslike( @_,
+                  sub {
+                      my ($file, %entry) = @_;
+                      return unless $entry{mtime};
+                      return unless (stat $file)[9] > $entry{mtime};
+                      print "Reverting: $file\n";
+                      my $text = _text_name( %entry );
+                      if (-e $text) {
+                          File::Copy::copy($text, $file);
+                      }
+                      else {
+                          `cvs up -p -r $entry{version} $file > $file`;
+                      }
+                      # touch it back so we know it's good
+                      utime $entry{mtime}, $entry{mtime}, $file;
+                  }
+                );
 };
 
 =head2 C<rgrep>
@@ -213,9 +238,24 @@ $simulated{all}{rgrep} = sub {
     }
 
     die "no pattern" unless defined $pattern;
-    for my $file (non_vcs_files->in( @_ ? @_ : '.' )) {
-        system 'grep', '-H', @switches, '--', $pattern, $file;
+
+    if (-e '.svn') { # subversion, just don't peek in .svn
+        for my $file ( find( or => [ rule( directory =>
+                                           name => '.svn',
+                                           prune => discard => ),
+                                     rule( file => ) ],
+                             in => @_ ? @_ : '.' ) ) {
+            system 'grep', '-H', @switches, '--', $pattern, $file;
+        }
+        return 0;
     }
+
+    # if we made it this far, it's CVS
+    walk_cvslike( @_,
+                  sub {
+                      my $file = shift;
+                      system 'grep', '-H', @switches, '--', $pattern, $file;
+                  } );
     0;
 };
 
@@ -253,7 +293,8 @@ exec     $command, @ARGV;
 
 =head1 TODO
 
-honour .cvsignore for CVS C<st>
+have rgrep honour svnignore property (currently it just
+excludes things inside .svn dirs for subversion)
 
 improve parameter parsing
 

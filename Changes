@@ -1,3 +1,9 @@
+0.04	20th January 2003
+	CVS st honours .cvsignore
+	a fairly complete rewrite to make the file walk more
+	consistent with true cvs behaviour
+	should now be <5.6 friendly
+
 0.03	18th December 2002	
 	CVS st copes with added files.
 	CVS get_texts split out from up so it can be independantly invoked
